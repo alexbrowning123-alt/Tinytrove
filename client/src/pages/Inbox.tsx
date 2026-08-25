@@ -199,7 +199,7 @@ export default function Inbox() {
                   const acceptedCheckout =
                     !isSeller &&
                     thread.data?.listing?.status === "reserved" &&
-                    m.text.startsWith("Offer accepted — complete checkout");
+                    m.text.startsWith("Offer accepted — awaiting payment");
                   return (
                     <div key={m.id} className={`group flex items-center gap-2 ${mine ? "justify-end" : "justify-start"}`}>
                       <div
@@ -218,7 +218,7 @@ export default function Inbox() {
                             }
                             className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-foreground px-3 py-1.5 text-xs font-600 text-background transition hover:bg-foreground/90"
                           >
-                            <ShoppingBag size={13} /> Complete checkout
+                            <ShoppingBag size={13} /> Pay now
                           </button>
                         )}
                         <p className={`mt-1 text-[10px] ${mine ? "text-primary-foreground/70" : "text-muted-foreground"}`}>
@@ -335,7 +335,7 @@ export default function Inbox() {
 
 const OFFER_STATUS_LABEL: Record<Offer["status"], string> = {
   pending: "Pending",
-  accepted: "Accepted",
+  accepted: "Awaiting payment",
   declined: "Declined",
   completed: "Sold",
   cancelled: "Cancelled",
@@ -422,13 +422,13 @@ function OfferCard({
             onClick={onComplete}
             className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-primary px-3 py-1.5 text-xs font-600 text-primary-foreground transition hover:bg-primary/90"
           >
-            <ShoppingBag size={13} /> Complete checkout
+            <ShoppingBag size={13} /> Pay now
           </button>
         )}
 
         {offer.status === "accepted" && isSeller && (
           <p className="mt-1 text-[11px] text-muted-foreground">
-            Awaiting the buyer’s checkout.
+            Awaiting payment from the buyer.
           </p>
         )}
         {offer.status === "pending" && !recipient && (

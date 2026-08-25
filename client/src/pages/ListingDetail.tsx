@@ -209,13 +209,13 @@ export default function ListingDetail() {
             acceptedOffer.data ? (
               <div className="mt-6 flex flex-col gap-2">
                 <div className="rounded-full bg-primary/10 px-6 py-3 text-center text-sm font-600 text-primary">
-                  Offer accepted at {formatPrice(acceptedOffer.data.price)} — complete checkout
+                  Offer accepted at {formatPrice(acceptedOffer.data.price)} — awaiting payment
                 </div>
                 <button
                   onClick={handleBuy}
                   className="flex-1 rounded-full bg-primary px-6 py-3 text-sm font-600 text-primary-foreground transition hover:bg-primary/90"
                 >
-                  Complete checkout
+                  Pay now
                 </button>
               </div>
             ) : isOwner ? (

@@ -622,7 +622,7 @@ export class DatabaseStorage implements IStorage {
           .values({
             threadId: offer.threadId,
             senderId: actorId,
-            text: `Offer accepted — complete checkout at ${fmtPrice(offer.price)}`,
+            text: `Offer accepted — awaiting payment at ${fmtPrice(offer.price)}`,
             createdAt: nowISO(),
           })
           .run();
