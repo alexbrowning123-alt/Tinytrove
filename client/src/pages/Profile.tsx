@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link } from "wouter";
 import { MapPin, Calendar, Package, LogOut } from "lucide-react";
 import { useMe, useSellerListings, useUser, useRelistListing, useLogout } from "@/lib/hooks";
@@ -164,6 +165,8 @@ export default function Profile() {
         <QuickLink href="/favorites" label="Saved" />
       </div>
 
+      {me.data && <PayoutsCard />}
+
       {me.data && (
         <button
           type="button"
@@ -254,6 +257,95 @@ export function SellerProfile() {
           <ListingsList items={listings.data ?? []} />
         )}
       </div>
+    </div>
+  );
+}
+
+// Seller payouts via Stripe Connect. Hidden entirely when Stripe isn't
+// configured (e.g. before the platform goes live). Lets a seller connect their
+// own Stripe account so buyers can pay them directly.
+function PayoutsCard() {
+  const status = useStripeStatus();
+  const onboard = useStripeOnboard();
+  const [error, setError] = useState<string | null>(null);
+
+  if (status.isLoading) {
+    return (
+      <div className="mt-4 rounded-xl border border-border/70 bg-card p-4 text-sm text-muted-foreground">
+        Checking payout setup…
+      </div>
+    );
+  }
+  if (!status.data?.enabled) return null;
+
+  const connected = !!status.data.connected;
+  const ready = !!status.data.chargesEnabled;
+
+  const start = () => {
+    setError(null);
+    onboard.mutate(undefined, {
+      onError: (e: Error) => {
+        const msg = (e.message || "").includes(":")
+          ? e.message.split(":").slice(1).join(":").trim()
+          : e.message;
+        setError(msg || "Couldn't start Stripe setup.");
+      },
+    });
+  };
+
+  return (
+    <div className="mt-4 rounded-xl border border-border/70 bg-card p-4">
+      <div className="flex items-center gap-2">
+        <Wallet size={16} className="text-primary" />
+        <h2 className="text-sm font-600">Payouts</h2>
+      </div>
+      {ready ? (
+        <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
+          <CheckCircle2 size={15} className="text-primary" />
+          Stripe connected — you can accept paid offers.
+        </div>
+      ) : connected ? (
+        <div className="mt-2">
+          <p className="text-sm text-muted-foreground">
+            Your Stripe account needs finishing before you can accept paid offers.
+          </p>
+          <button
+            onClick={start}
+            disabled={onboard.isPending}
+            className="mt-3 w-full rounded-full bg-primary px-6 py-2.5 text-sm font-600 text-primary-foreground transition hover:bg-primary/90 disabled:opacity-50"
+          >
+            {onboard.isPending ? (
+              <span className="inline-flex items-center gap-2">
+                <Loader2 size={15} className="animate-spin" /> Opening Stripe…
+              </span>
+            ) : (
+              "Finish Stripe setup"
+            )}
+          </button>
+        </div>
+      ) : (
+        <div className="mt-2">
+          <p className="text-sm text-muted-foreground">
+            Connect a Stripe account to receive payments when your items sell.
+          </p>
+          <button
+            onClick={start}
+            disabled={onboard.isPending}
+            className="mt-3 w-full rounded-full bg-primary px-6 py-2.5 text-sm font-600 text-primary-foreground transition hover:bg-primary/90 disabled:opacity-50"
+          >
+            {onboard.isPending ? (
+              <span className="inline-flex items-center gap-2">
+                <Loader2 size={15} className="animate-spin" /> Opening Stripe…
+              </span>
+            ) : (
+              "Set up payouts"
+            )}
+          </button>
+        </div>
+      )}
+      {error && (
+        <p className="mt-2 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
+      )}
     </div>
   );
 }

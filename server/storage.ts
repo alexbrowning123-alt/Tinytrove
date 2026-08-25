@@ -8,6 +8,7 @@ import {
   orders,
   orderItems,
   offers,
+  payments,
   type User,
   type Listing,
   type Favorite,
@@ -17,6 +18,7 @@ import {
   type Order,
   type OrderItem,
   type Offer,
+  type Payment,
   type InsertListing,
   type InsertFavorite,
   type InsertThread,
@@ -136,12 +138,43 @@ sqlite.exec(`
     created_at TEXT NOT NULL,
     responded_at TEXT
   );
+  CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stripe_checkout_session_id TEXT NOT NULL UNIQUE,
+    stripe_payment_intent_id TEXT,
+    listing_id INTEGER NOT NULL,
+    offer_id INTEGER,
+    buyer_id INTEGER NOT NULL,
+    seller_id INTEGER NOT NULL,
+    amount_pence INTEGER NOT NULL,
+    application_fee_pence INTEGER NOT NULL DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT 'gbp',
+    status TEXT NOT NULL DEFAULT 'pending',
+    order_id INTEGER,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+  );
 `);
 
 // Add the offer_id column to messages on older DBs that lack it.
 const msgCols = sqlite.pragma("table_info(messages)") as Array<{ name: string }>;
 if (!msgCols.some((c) => c.name === "offer_id")) {
   sqlite.exec("ALTER TABLE messages ADD COLUMN offer_id INTEGER");
+}
+
+// Stripe Connect columns on users — added after the fact on older DBs.
+const userCols = sqlite.pragma("table_info(users)") as Array<{ name: string }>;
+const stripeUserCols: Array<[string, string]> = [
+  ["stripe_account_id", "TEXT"],
+  ["stripe_charges_enabled", "INTEGER NOT NULL DEFAULT 0"],
+  ["stripe_payouts_enabled", "INTEGER NOT NULL DEFAULT 0"],
+  ["stripe_details_submitted", "INTEGER NOT NULL DEFAULT 0"],
+  ["stripe_onboarding_complete", "INTEGER NOT NULL DEFAULT 0"],
+];
+for (const [name, def] of stripeUserCols) {
+  if (!userCols.some((c) => c.name === name)) {
+    sqlite.exec(`ALTER TABLE users ADD COLUMN ${name} ${def}`);
+  }
 }
 
 export const db = drizzle(sqlite);
@@ -242,6 +275,7 @@ export interface IStorage {
   respondToOffer(offerId: number, actorId: number, accept: boolean): Promise<Offer>;
   getAcceptedOfferForBuyer(listingId: number, buyerId: number): Promise<Offer | undefined>;
   completeOffer(offerId: number, orderId: number): Promise<void>;
+  getOfferById(offerId: number): Promise<Offer | undefined>;
   cancelOfferForListing(listingId: number, actorId: number): Promise<void>;
   seedThread(listingId: number, buyerId: number, sellerId: number, messages: Array<{ senderId: number; text: string; offsetHours: number }>): Promise<void>;
   // cart
@@ -253,6 +287,12 @@ export interface IStorage {
   getOrders(userId: number): Promise<(Order & { items: OrderItem[] })[]>;
   getOrder(orderId: number, buyerId: number): Promise<(Order & { items: OrderItem[] }) | undefined>;
   deleteOrder(orderId: number, buyerId: number): Promise<void>;
+  // stripe connect + payments
+  setStripeAccount(userId: number, accountId: string): Promise<void>;
+  updateStripeStatus(userId: number, fields: Partial<{ chargesEnabled: number; payoutsEnabled: number; detailsSubmitted: number; onboardingComplete: number; }>): Promise<void>;
+  getPaymentBySession(sessionId: string): Promise<Payment | undefined>;
+  createPayment(input: { stripeCheckoutSessionId: string; listingId: number; offerId?: number | null; buyerId: number; sellerId: number; amountPence: number; applicationFeePence: number; currency: string; }): Promise<Payment>;
+  markPaymentPaid(sessionId: string, opts: { orderId: number; paymentIntentId?: string | null; }): Promise<void>;
 }
 
 export interface ListFilters {
@@ -662,6 +702,10 @@ export class DatabaseStorage implements IStorage {
       .run();
   }
 
+  async getOfferById(offerId: number): Promise<Offer | undefined> {
+    return db.select().from(offers).where(eq(offers.id, offerId)).get();
+  }
+
   // A seller releases a reserved listing (e.g. the buyer abandoned checkout).
   // Cancels the accepted offer, returns the item to the feed, and posts a
   // message in every affected thread so the other party is informed.
@@ -821,6 +865,52 @@ export class DatabaseStorage implements IStorage {
     if (!order || order.buyerId !== buyerId) return;
     db.delete(orderItems).where(eq(orderItems.orderId, orderId)).run();
     db.delete(orders).where(eq(orders.id, orderId)).run();
+  }
+
+  // --- Stripe Connect (seller payouts) + payments (webhook idempotency) ---
+
+  async setStripeAccount(userId: number, accountId: string): Promise<void> {
+    db.update(users).set({ stripeAccountId: accountId }).where(eq(users.id, userId)).run();
+  }
+
+  async updateStripeStatus(userId: number, fields: Partial<{ chargesEnabled: number; payoutsEnabled: number; detailsSubmitted: number; onboardingComplete: number; }>): Promise<void> {
+    const patch: Partial<User> = {};
+    if (fields.chargesEnabled !== undefined) patch.stripeChargesEnabled = fields.chargesEnabled ? 1 : 0;
+    if (fields.payoutsEnabled !== undefined) patch.stripePayoutsEnabled = fields.payoutsEnabled ? 1 : 0;
+    if (fields.detailsSubmitted !== undefined) patch.stripeDetailsSubmitted = fields.detailsSubmitted ? 1 : 0;
+    if (fields.onboardingComplete !== undefined) patch.stripeOnboardingComplete = fields.onboardingComplete ? 1 : 0;
+    if (Object.keys(patch).length === 0) return;
+    db.update(users).set(patch).where(eq(users.id, userId)).run();
+  }
+
+  async getPaymentBySession(sessionId: string): Promise<Payment | undefined> {
+    return db.select().from(payments).where(eq(payments.stripeCheckoutSessionId, sessionId)).get();
+  }
+
+  async createPayment(input: { stripeCheckoutSessionId: string; listingId: number; offerId?: number | null; buyerId: number; sellerId: number; amountPence: number; applicationFeePence: number; currency: string; }): Promise<Payment> {
+    return db
+      .insert(payments)
+      .values({
+        stripeCheckoutSessionId: input.stripeCheckoutSessionId,
+        listingId: input.listingId,
+        offerId: input.offerId ?? null,
+        buyerId: input.buyerId,
+        sellerId: input.sellerId,
+        amountPence: input.amountPence,
+        applicationFeePence: input.applicationFeePence,
+        currency: input.currency,
+        status: "pending",
+        createdAt: nowISO(),
+      })
+      .returning()
+      .get();
+  }
+
+  async markPaymentPaid(sessionId: string, opts: { orderId: number; paymentIntentId?: string | null; }): Promise<void> {
+    db.update(payments)
+      .set({ status: "paid", orderId: opts.orderId, stripePaymentIntentId: opts.paymentIntentId ?? null, completedAt: nowISO() })
+      .where(eq(payments.stripeCheckoutSessionId, sessionId))
+      .run();
   }
 
   async seedThread(

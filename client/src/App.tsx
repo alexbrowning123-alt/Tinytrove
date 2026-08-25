@@ -12,6 +12,7 @@ import Sell from "@/pages/Sell";
 import Favorites from "@/pages/Favorites";
 import Cart from "@/pages/Cart";
 import Checkout from "@/pages/Checkout";
+import CheckoutSuccess from "@/pages/CheckoutSuccess";
 import OrderConfirmation from "@/pages/OrderConfirmation";
 import Orders from "@/pages/Orders";
 import Inbox from "@/pages/Inbox";
@@ -35,6 +36,7 @@ function AppRouter() {
           <Route path="/favorites" component={Favorites} />
           <Route path="/cart" component={Cart} />
           <Route path="/checkout" component={Checkout} />
+          <Route path="/checkout/success" component={CheckoutSuccess} />
           <Route path="/checkout/:listingId" component={Checkout} />
           <Route path="/order/:id" component={OrderConfirmation} />
           <Route path="/orders" component={Orders} />

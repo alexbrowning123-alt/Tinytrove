@@ -486,3 +486,60 @@ export function useDeleteMessage(threadId: number | null) {
     },
   });
 }
+
+// --- Stripe Connect (real checkout) ---
+
+export function useStripeConfig() {
+  return useQuery<{ enabled: boolean }>({
+    queryKey: ["/api/stripe/config"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/stripe/config");
+      return res.json();
+    },
+  });
+}
+
+export interface StripeStatus {
+  enabled: boolean;
+  connected: boolean;
+  chargesEnabled: boolean;
+  payoutsEnabled?: boolean;
+  detailsSubmitted?: boolean;
+  onboardingComplete: boolean;
+}
+
+export function useStripeStatus() {
+  return useQuery<StripeStatus>({
+    queryKey: ["/api/stripe/connect/status"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/stripe/connect/status");
+      return res.json();
+    },
+  });
+}
+
+export function useStripeOnboard() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/stripe/connect/onboard");
+      return res.json() as Promise<{ url: string }>;
+    },
+    onSuccess: (data) => {
+      // Redirect the seller into Stripe's hosted onboarding.
+      if (data?.url) window.location.href = data.url;
+      qc.invalidateQueries({ queryKey: ["/api/stripe/connect/status"] });
+    },
+  });
+}
+
+// Creates a Stripe Checkout Session for a single listing and redirects the
+// buyer to Stripe's hosted payment page.
+export function useCreateCheckoutSession() {
+  return useMutation({
+    mutationFn: async (listingId: number) => {
+      const res = await apiRequest("POST", "/api/stripe/checkout-session", { listingId });
+      return res.json() as Promise<{ url: string; sessionId: string }>;
+    },
+  });
+}

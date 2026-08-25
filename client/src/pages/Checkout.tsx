@@ -1,7 +1,16 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useLocation, useParams } from "wouter";
-import { ShieldCheck, ArrowLeft } from "lucide-react";
-import { useCart, useCheckout, useBuyNow, useListing, useAcceptedOffer, useMe } from "@/lib/hooks";
+import { ShieldCheck, ArrowLeft, Loader2 } from "lucide-react";
+import {
+  useCart,
+  useCheckout,
+  useBuyNow,
+  useListing,
+  useAcceptedOffer,
+  useMe,
+  useStripeConfig,
+  useCreateCheckoutSession,
+} from "@/lib/hooks";
 import type { DeliveryDetails } from "@/lib/hooks";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatPrice, mediaUrl } from "@/components/common";
@@ -37,6 +46,10 @@ export default function Checkout() {
   const buyNow = useBuyNow();
   const pending = checkout.isPending || buyNow.isPending;
 
+  const stripeConfig = useStripeConfig();
+  const createSession = useCreateCheckoutSession();
+  const stripeEnabled = !!stripeConfig.data?.enabled && buyNowId != null;
+
   if (!me.isLoading && !me.data) {
     setTimeout(() => {
       if (window.location.hash !== "#/login") window.location.hash = "#/login";
@@ -58,8 +71,6 @@ export default function Checkout() {
     else if (singleListing.data) {
       const l = singleListing.data;
       const imgs: string[] = (l as any).imageList ?? [];
-      // If the buyer has an accepted offer, the checkout happens at the agreed
-      // price (resolved server-side); show that price in the summary.
       const offerPrice = acceptedOffer.data?.price ?? null;
       const price = offerPrice ?? l.price;
       summaryItems = [{ id: l.id, title: l.title, price, image: imgs[0], brand: l.brand }];
@@ -80,6 +91,19 @@ export default function Checkout() {
   }
 
   const set = (k: keyof DeliveryDetails, v: string) => setForm((f) => ({ ...f, [k]: v }));
+
+  // Stripe path: redirect the buyer to Stripe's hosted checkout.
+  const handleStripePay = async () => {
+    setError(null);
+    try {
+      const res = await createSession.mutateAsync(buyNowId!);
+      if (res?.url) window.location.href = res.url;
+    } catch (err) {
+      const msg = (err as Error).message || "";
+      const detail = msg.includes(":") ? msg.split(":").slice(1).join(":").trim() : msg;
+      setError(detail || "Couldn't start payment. Please try again.");
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -121,36 +145,66 @@ export default function Checkout() {
       <h1 className="font-serif text-xl font-700">Checkout</h1>
 
       <div className="mt-5 grid gap-6 md:grid-cols-[1fr_minmax(0,340px)]">
-        {/* Delivery form */}
-        <form onSubmit={handleSubmit} className="space-y-4 rounded-xl border border-border/70 bg-card p-4">
-          <div>
-            <h2 className="text-sm font-600">Delivery details</h2>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              This is a demo checkout — no real payment is taken and no card details are requested.
+        {/* Left: payment form / Stripe pay card */}
+        {stripeEnabled ? (
+          <div className="space-y-4 rounded-xl border border-border/70 bg-card p-4">
+            <div>
+              <h2 className="text-sm font-600">Secure card payment</h2>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                You'll be redirected to Stripe to enter your card and delivery details safely.
+              </p>
+            </div>
+            {error && (
+              <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
+            )}
+            <button
+              onClick={handleStripePay}
+              disabled={!ready || createSession.isPending}
+              className="w-full rounded-full bg-primary px-6 py-3 text-sm font-600 text-primary-foreground transition hover:bg-primary/90 disabled:opacity-50"
+            >
+              {createSession.isPending ? (
+                <span className="inline-flex items-center gap-2">
+                  <Loader2 size={16} className="animate-spin" /> Starting payment…
+                </span>
+              ) : (
+                `Pay ${formatPrice(total)}`
+              )}
+            </button>
+            <p className="text-center text-xs text-muted-foreground">
+              Powered by Stripe. Your card details never touch our servers.
             </p>
           </div>
+        ) : (
+          <form onSubmit={handleSubmit} className="space-y-4 rounded-xl border border-border/70 bg-card p-4">
+            <div>
+              <h2 className="text-sm font-600">Delivery details</h2>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                This is a demo checkout — no real payment is taken and no card details are requested.
+              </p>
+            </div>
 
-          <Field label="Full name" value={form.deliveryName} onChange={(v) => set("deliveryName", v)} autoComplete="name" />
-          <Field label="Address line 1" value={form.deliveryAddress1} onChange={(v) => set("deliveryAddress1", v)} autoComplete="address-line1" />
-          <Field label="Address line 2 (optional)" value={form.deliveryAddress2 ?? ""} onChange={(v) => set("deliveryAddress2", v)} autoComplete="address-line2" />
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Town / city" value={form.deliveryCity} onChange={(v) => set("deliveryCity", v)} autoComplete="address-level2" />
-            <Field label="Postcode" value={form.deliveryPostcode} onChange={(v) => set("deliveryPostcode", v)} autoComplete="postal-code" />
-          </div>
-          <Field label="Contact email" type="email" value={form.contactEmail} onChange={(v) => set("contactEmail", v)} autoComplete="email" />
+            <Field label="Full name" value={form.deliveryName} onChange={(v) => set("deliveryName", v)} autoComplete="name" />
+            <Field label="Address line 1" value={form.deliveryAddress1} onChange={(v) => set("deliveryAddress1", v)} autoComplete="address-line1" />
+            <Field label="Address line 2 (optional)" value={form.deliveryAddress2 ?? ""} onChange={(v) => set("deliveryAddress2", v)} autoComplete="address-line2" />
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Town / city" value={form.deliveryCity} onChange={(v) => set("deliveryCity", v)} autoComplete="address-level2" />
+              <Field label="Postcode" value={form.deliveryPostcode} onChange={(v) => set("deliveryPostcode", v)} autoComplete="postal-code" />
+            </div>
+            <Field label="Contact email" type="email" value={form.contactEmail} onChange={(v) => set("contactEmail", v)} autoComplete="email" />
 
-          {error && (
-            <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
-          )}
+            {error && (
+              <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
+            )}
 
-          <button
-            type="submit"
-            disabled={pending || !ready}
-            className="w-full rounded-full bg-primary px-6 py-3 text-sm font-600 text-primary-foreground transition hover:bg-primary/90 disabled:opacity-50"
-          >
-            {pending ? "Placing order…" : `Pay ${formatPrice(total)}`}
-          </button>
-        </form>
+            <button
+              type="submit"
+              disabled={pending || !ready}
+              className="w-full rounded-full bg-primary px-6 py-3 text-sm font-600 text-primary-foreground transition hover:bg-primary/90 disabled:opacity-50"
+            >
+              {pending ? "Placing order…" : `Pay ${formatPrice(total)}`}
+            </button>
+          </form>
+        )}
 
         {/* Order summary */}
         <div className="rounded-xl border border-border/70 bg-card p-4">
@@ -200,7 +254,11 @@ export default function Checkout() {
               </div>
               <div className="mt-4 flex items-start gap-2 rounded-lg bg-muted/50 p-3 text-xs text-muted-foreground">
                 <ShieldCheck size={16} className="mt-0.5 shrink-0" />
-                <p>Demo marketplace — no money changes hands. The seller is notified and the item is marked sold.</p>
+                <p>
+                  {stripeEnabled
+                    ? "Payments are processed by Stripe. The seller is notified and the item marked sold once payment is confirmed."
+                    : "Demo marketplace — no money changes hands. The seller is notified and the item is marked sold."}
+                </p>
               </div>
             </>
           )}

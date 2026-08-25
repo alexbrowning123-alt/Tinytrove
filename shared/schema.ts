@@ -14,6 +14,12 @@ export const users = sqliteTable("users", {
   rating: real("rating").notNull(),
   reviews: integer("reviews").notNull(),
   bio: text("bio"),
+  // Stripe Connect (Express) — set when a seller connects payouts.
+  stripeAccountId: text("stripe_account_id"),
+  stripeChargesEnabled: integer("stripe_charges_enabled").notNull().default(0),
+  stripePayoutsEnabled: integer("stripe_payouts_enabled").notNull().default(0),
+  stripeDetailsSubmitted: integer("stripe_details_submitted").notNull().default(0),
+  stripeOnboardingComplete: integer("stripe_onboarding_complete").notNull().default(0),
 });
 
 export const listings = sqliteTable("listings", {
@@ -113,6 +119,25 @@ export const orderItems = sqliteTable("order_items", {
   image: text("image"),
 });
 
+// Tracks a Stripe Checkout Session so webhook retries can't create duplicate
+// orders. The session id is unique; finalization is idempotent on it.
+export const payments = sqliteTable("payments", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  stripeCheckoutSessionId: text("stripe_checkout_session_id").notNull().unique(),
+  stripePaymentIntentId: text("stripe_payment_intent_id"),
+  listingId: integer("listing_id").notNull(),
+  offerId: integer("offer_id"),
+  buyerId: integer("buyer_id").notNull(),
+  sellerId: integer("seller_id").notNull(),
+  amountPence: integer("amount_pence").notNull(),
+  applicationFeePence: integer("application_fee_pence").notNull().default(0),
+  currency: text("currency").notNull().default("gbp"),
+  status: text("status").notNull().default("pending"), // pending | paid | failed
+  orderId: integer("order_id"),
+  createdAt: text("created_at").notNull(),
+  completedAt: text("completed_at"),
+});
+
 // Insert schemas
 export const insertListingSchema = createInsertSchema(listings).omit({
   id: true,
@@ -152,6 +177,7 @@ export type Offer = typeof offers.$inferSelect;
 export type CartItem = typeof cartItems.$inferSelect;
 export type Order = typeof orders.$inferSelect;
 export type OrderItem = typeof orderItems.$inferSelect;
+export type Payment = typeof payments.$inferSelect;
 
 // Auth is session-based (signed JWT in a __Host- cookie). There is no
 // fixed "current user" — the authenticated user is resolved per request.

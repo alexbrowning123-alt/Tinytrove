@@ -8,6 +8,18 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import multer from "multer";
 import { storage, type OrderDelivery, CartError } from "./storage";
+import {
+  isStripeConfigured,
+  getStripe,
+  createConnectAccount,
+  createOnboardingLink,
+  getAccountStatus,
+  createCheckoutSession,
+  toPence,
+  platformFeeBps,
+  computeFeePence,
+  type StripeAccountStatus,
+} from "./stripe";
 import { insertListingSchema, type PublicUser, type User, type InsertListing } from "@shared/schema";
 
 // ---------- Auth helpers ----------
@@ -407,6 +419,30 @@ export async function registerRoutes(
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ message: "Invalid id" });
     try {
+      // When real payments are enabled, the seller must have finished Stripe
+      // Connect onboarding before they can accept an offer — otherwise the
+      // buyer would hit a dead end at checkout.
+      if (isStripeConfigured()) {
+        const offer = await storage.getOfferById(id);
+        if (!offer) return res.status(404).json({ message: "Offer not found" });
+        if (offer.sellerId !== req.user!.id) {
+          return res.status(403).json({ message: "Only the seller can accept this offer" });
+        }
+        const seller = await storage.getUser(offer.sellerId);
+        if (!seller?.stripeAccountId) {
+          return res.status(409).json({
+            code: "seller-payouts-required",
+            message: "Set up Stripe payouts before accepting offers.",
+          });
+        }
+        const status = await getAccountStatus(seller.stripeAccountId);
+        if (!status.chargesEnabled) {
+          return res.status(409).json({
+            code: "seller-payouts-required",
+            message: "Finish Stripe payout setup before accepting offers.",
+          });
+        }
+      }
       const offer = await storage.respondToOffer(id, req.user!.id, true);
       res.json(offer);
     } catch (e) {
@@ -565,7 +601,242 @@ export async function registerRoutes(
     res.json(await storage.getListingsBySeller(Number(req.params.id)));
   });
 
+  // ---------- Stripe Connect (real checkout) ----------
+  // Feature-gated: if STRIPE_SECRET_KEY is not set, these endpoints report
+  // that Stripe isn't configured and the existing simulated checkout keeps
+  // working unchanged.
+
+  app.get("/api/stripe/config", (req, res) => {
+    res.json({ enabled: isStripeConfigured() });
+  });
+
+  // Seller's current Stripe Connect status, with a fresh live lookup if an
+  // account exists. Also returns whether payouts are required to accept offers.
+  app.get("/api/stripe/connect/status", requireAuth, async (req, res) => {
+    const user = await storage.getUser(req.user!.id);
+    if (!user) return res.status(404).json({ message: "Not found" });
+    if (!isStripeConfigured()) {
+      return res.json({ enabled: false, connected: false, chargesEnabled: false, onboardingComplete: false });
+    }
+    if (!user.stripeAccountId) {
+      return res.json({ enabled: true, connected: false, chargesEnabled: false, onboardingComplete: false });
+    }
+    let status: StripeAccountStatus;
+    try {
+      status = await getAccountStatus(user.stripeAccountId);
+    } catch {
+      return res.json({
+        enabled: true,
+        connected: true,
+        chargesEnabled: !!user.stripeChargesEnabled,
+        onboardingComplete: !!user.stripeOnboardingComplete,
+      });
+    }
+    await storage.updateStripeStatus(user.id, status);
+    res.json({
+      enabled: true,
+      connected: true,
+      chargesEnabled: status.chargesEnabled,
+      payoutsEnabled: status.payoutsEnabled,
+      detailsSubmitted: status.detailsSubmitted,
+      onboardingComplete: status.onboardingComplete,
+    });
+  });
+
+  // Start (or resume) Stripe Express onboarding for the logged-in seller.
+  app.post("/api/stripe/connect/onboard", requireAuth, async (req, res) => {
+    if (!isStripeConfigured()) return res.status(503).json({ message: "Stripe is not configured yet." });
+    const user = await storage.getUser(req.user!.id);
+    if (!user) return res.status(404).json({ message: "Not found" });
+    try {
+      let accountId = user.stripeAccountId;
+      if (!accountId) {
+        const created = await createConnectAccount({ id: user.id, email: user.email });
+        accountId = created.id;
+        await storage.setStripeAccount(user.id, accountId);
+        await storage.updateStripeStatus(user.id, created.status);
+      }
+      const link = await createOnboardingLink(accountId!);
+      res.json({ url: link.url });
+    } catch (e) {
+      res.status(400).json({ message: (e as Error).message || "Could not start Stripe onboarding" });
+    }
+  });
+
+  // Create a Stripe Checkout Session for a single listing. The buyer pays the
+  // accepted-offer price if one exists, otherwise the listing price. The money
+  // is split: the seller's connected account receives the payment minus the
+  // platform fee. A pending payment row is written for webhook idempotency.
+  app.post("/api/stripe/checkout-session", requireAuth, async (req, res) => {
+    if (!isStripeConfigured()) return res.status(503).json({ message: "Stripe is not configured yet." });
+    const listingId = Number(req.body?.listingId);
+    if (!Number.isFinite(listingId)) return res.status(400).json({ message: "Invalid listing id" });
+    try {
+      const listing = await storage.getListing(listingId);
+      if (!listing) return res.status(404).json({ message: "Listing not found" });
+      if (listing.sellerId === req.user!.id) return res.status(403).json({ message: "You can't buy your own listing" });
+
+      const seller = await storage.getUser(listing.sellerId);
+      if (!seller?.stripeAccountId) {
+        return res.status(409).json({ code: "seller-payouts-required", message: "The seller hasn't set up payments yet." });
+      }
+      const sellerStatus = await getAccountStatus(seller.stripeAccountId);
+      if (!sellerStatus.chargesEnabled) {
+        return res.status(409).json({ code: "seller-payouts-required", message: "The seller's payouts aren't ready yet." });
+      }
+
+      // Resolve the price: accepted offer for this buyer, else listing price.
+      const acceptedOffer = await storage.getAcceptedOfferForBuyer(listingId, req.user!.id);
+      const pricePounds = acceptedOffer ? acceptedOffer.price : listing.price;
+      const amountPence = toPence(pricePounds);
+      if (amountPence < 50) return res.status(400).json({ message: "Amount is too small to charge." });
+
+      const bps = platformFeeBps();
+      const feePence = computeFeePence(amountPence, bps);
+
+      const session = await createCheckoutSession({
+        amountPence,
+        applicationFeePence: feePence,
+        listingId,
+        offerId: acceptedOffer?.id ?? null,
+        buyerId: req.user!.id,
+        sellerId: seller.id,
+        sellerStripeAccountId: seller.stripeAccountId,
+        listingTitle: listing.title,
+        buyerEmail: req.user!.email,
+      });
+
+      await storage.createPayment({
+        stripeCheckoutSessionId: session.id,
+        listingId,
+        offerId: acceptedOffer?.id ?? null,
+        buyerId: req.user!.id,
+        sellerId: seller.id,
+        amountPence,
+        applicationFeePence: feePence,
+        currency: "gbp",
+      });
+
+      res.json({ url: session.url, sessionId: session.id });
+    } catch (e) {
+      res.status(400).json({ message: (e as Error).message || "Could not start checkout" });
+    }
+  });
+
+  // Stripe webhook. The raw body is captured by the global express.json()
+  // `verify` hook (req.rawBody); we verify the signature, then finalize the
+  // order idempotently. This is the source of truth — the success redirect
+  // only shows a confirmation page.
+  app.post("/api/stripe/webhook", async (req, res) => {
+    if (!isStripeConfigured()) return res.status(503).json({ message: "Stripe not configured" });
+    const sig = req.headers["stripe-signature"] as string;
+    const raw = req.rawBody as unknown as Buffer | string | undefined;
+    if (!sig || !raw) return res.status(400).json({ message: "Missing signature" });
+    let event;
+    try {
+      event = getStripe().webhooks.constructEvent(raw, sig, process.env.STRIPE_WEBHOOK_SECRET!);
+    } catch (err) {
+      console.error("[stripe] webhook signature verification failed:", (err as Error).message);
+      return res.status(400).json({ message: "Invalid signature" });
+    }
+    try {
+      if (event.type === "checkout.session.completed") {
+        await finalizeStripeCheckout(event.data.object);
+      }
+      res.json({ received: true });
+    } catch (e) {
+      console.error("[stripe] webhook finalize failed:", (e as Error).message);
+      // 500 so Stripe retries; finalize is idempotent so a retry is safe.
+      res.status(500).json({ message: "Internal error" });
+    }
+  });
+
   return _httpServer;
+}
+
+/** Idempotently finalize a paid Stripe Checkout Session into a marketplace
+ *  order: creates the order (marking the listing sold), completes the accepted
+ *  offer, posts a confirmation message, and marks the payment paid. Safe to call
+ *  on webhook retries — a session already marked paid is a no-op. */
+async function finalizeStripeCheckout(session: any) {
+  const sessionId: string | undefined = session?.id;
+  if (!sessionId) return;
+
+  // Ensure a payment row exists (it's normally created at session-creation time,
+  // but reconstruct from metadata if the webhook beat that or the row is gone).
+  let payment = await storage.getPaymentBySession(sessionId);
+  if (!payment) {
+    const md = session?.metadata || {};
+    const listingId = Number(md.listingId);
+    const offerId = md.offerId ? Number(md.offerId) : null;
+    const buyerId = Number(md.buyerId);
+    const sellerId = Number(md.sellerId);
+    const amountPence = Number(md.amountPence);
+    const applicationFeePence = Number(md.applicationFeePence || 0);
+    if (!listingId || !buyerId || !sellerId || !Number.isFinite(amountPence)) {
+      console.error(`[stripe] webhook: session ${sessionId} has no payment row and incomplete metadata`);
+      return;
+    }
+    payment = await storage.createPayment({
+      stripeCheckoutSessionId: sessionId,
+      listingId,
+      offerId,
+      buyerId,
+      sellerId,
+      amountPence,
+      applicationFeePence,
+      currency: "gbp",
+    });
+  }
+
+  // Idempotency guard: a session already finalized is a no-op.
+  if (payment.status === "paid") return;
+
+  const paymentStatus: string | undefined = session?.payment_status;
+  if (paymentStatus !== "paid" && paymentStatus !== "no_payment_required") {
+    console.log(`[stripe] session ${sessionId} not paid (${paymentStatus}) — skipping`);
+    return;
+  }
+
+  const listing = await storage.getListing(payment.listingId);
+  if (!listing) {
+    console.error(`[stripe] webhook: listing ${payment.listingId} not found`);
+    return;
+  }
+
+  // Delivery details come from Stripe's collected shipping address.
+  const shipping = session?.shipping_details;
+  const addr = shipping?.address || {};
+  const delivery: OrderDelivery = {
+    deliveryName: shipping?.name || session?.customer_details?.name || "Buyer",
+    deliveryAddress1: addr.line1 || "Address on file",
+    deliveryAddress2: addr.line2 || undefined,
+    deliveryCity: addr.city || "—",
+    deliveryPostcode: addr.postal_code || "—",
+    contactEmail: session?.customer_details?.email || "",
+  };
+
+  // createOrder marks the listing sold and clears it from any carts.
+  const pricePounds = payment.amountPence / 100;
+  const order = await storage.createOrder(payment.buyerId, [payment.listingId], delivery, {
+    priceOverrides: { [payment.listingId]: pricePounds },
+    allowReserved: true,
+  });
+
+  if (payment.offerId) {
+    await storage.completeOffer(payment.offerId, order.id);
+    const offer = await storage.getOfferById(payment.offerId);
+    if (offer) {
+      await storage.sendMessage(offer.threadId, payment.sellerId, "Payment received — your order is confirmed.", payment.offerId);
+    }
+  }
+
+  await storage.markPaymentPaid(sessionId, {
+    orderId: order.id,
+    paymentIntentId: session?.payment_intent ?? null,
+  });
+
+  console.log(`[stripe] finalized checkout session ${sessionId} -> order ${order.id}`);
 }
 
 function pickColorFromEmail(email: string): string {
