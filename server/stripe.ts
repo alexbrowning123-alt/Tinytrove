@@ -12,10 +12,7 @@ export function getStripe(): Stripe {
     if (!process.env.STRIPE_SECRET_KEY) {
       throw new Error("Stripe is not configured (STRIPE_SECRET_KEY missing).");
     }
-    client = new Stripe(process.env.STRIPE_SECRET_KEY, {
-      // Pin to a recent stable API version for deterministic behavior.
-      apiVersion: "2025-08-27.basil" as any,
-    });
+    client = new Stripe(process.env.STRIPE_SECRET_KEY);
   }
   return client;
 }
