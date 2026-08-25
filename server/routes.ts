@@ -7,9 +7,8 @@ import crypto from "node:crypto";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import multer from "multer";
-import { storage, db, type OrderDelivery, CartError } from "./storage";
-import { inArray, like, or } from "drizzle-orm";
-import { insertListingSchema, type PublicUser, type User, type InsertListing, users, listings, threads, offers, messages, favorites, cartItems, orders, orderItems } from "@shared/schema";
+import { storage, type OrderDelivery, CartError } from "./storage";
+import { insertListingSchema, type PublicUser, type User, type InsertListing } from "@shared/schema";
 
 // ---------- Auth helpers ----------
 
@@ -564,50 +563,6 @@ export async function registerRoutes(
 
   app.get("/api/users/:id/listings", async (req, res) => {
     res.json(await storage.getListingsBySeller(Number(req.params.id)));
-  });
-
-
-  // TEMP: admin-only cleanup of test data created during deployment verification.
-  // Protected by the JWT secret; deletes accounts whose email/displayName match
-  // test patterns and cascades their listings/threads/offers/messages.
-  app.post("/api/admin/cleanup-test", (req, res) => {
-    const provided = req.headers["x-admin-secret"];
-    if (!provided || provided !== JWT_SECRET) {
-      return res.status(403).json({ message: "Forbidden" });
-    }
-    const testUserRows = db.select({ id: users.id }).from(users).where(or(
-      like(users.email, "%@tt.app"),
-      like(users.email, "persist-test-%@tinytrove.app"),
-      inArray(users.displayName, ["Seller Test", "Buyer Test", "Persist Test"]),
-    )).all();
-    const testUserIds = testUserRows.map((r) => r.id);
-    if (testUserIds.length === 0) {
-      return res.json({ deleted: { users: 0, listings: 0, threads: 0, offers: 0, messages: 0, favorites: 0, orders: 0, orderItems: 0, cartItems: 0 }, testUserIds: [] });
-    }
-    const testListingIds = db.select({ id: listings.id }).from(listings).where(inArray(listings.sellerId, testUserIds)).all().map((r) => r.id);
-    const testThreadIds = db.select({ id: threads.id }).from(threads).where(or(
-      inArray(threads.buyerId, testUserIds),
-      inArray(threads.sellerId, testUserIds),
-      testListingIds.length ? inArray(threads.listingId, testListingIds) : undefined,
-    )).all().map((r) => r.id);
-    const testOrderIds = db.select({ id: orders.id }).from(orders).where(inArray(orders.buyerId, testUserIds)).all().map((r) => r.id);
-    const deleted: Record<string, number> = { users: 0, listings: 0, threads: 0, offers: 0, messages: 0, favorites: 0, orders: 0, orderItems: 0, cartItems: 0 };
-    const maybe = (cond: boolean, col: ReturnType<typeof inArray>) => (cond ? col : undefined);
-    if (testOrderIds.length) deleted.orderItems = db.delete(orderItems).where(or(inArray(orderItems.orderId, testOrderIds), inArray(orderItems.listingId, testListingIds))).run().changes;
-    if (testOrderIds.length) deleted.orders = db.delete(orders).where(inArray(orders.id, testOrderIds)).run().changes;
-    deleted.cartItems = db.delete(cartItems).where(or(inArray(cartItems.userId, testUserIds), inArray(cartItems.listingId, testListingIds))).run().changes;
-    if (testThreadIds.length) deleted.messages = db.delete(messages).where(inArray(messages.threadId, testThreadIds)).run().changes;
-    deleted.offers = db.delete(offers).where(or(
-      testThreadIds.length ? inArray(offers.threadId, testThreadIds) : undefined,
-      inArray(offers.buyerId, testUserIds),
-      inArray(offers.sellerId, testUserIds),
-      inArray(offers.createdById, testUserIds),
-    )).run().changes;
-    if (testThreadIds.length) deleted.threads = db.delete(threads).where(inArray(threads.id, testThreadIds)).run().changes;
-    deleted.favorites = db.delete(favorites).where(or(inArray(favorites.userId, testUserIds), inArray(favorites.listingId, testListingIds))).run().changes;
-    if (testListingIds.length) deleted.listings = db.delete(listings).where(inArray(listings.id, testListingIds)).run().changes;
-    deleted.users = db.delete(users).where(inArray(users.id, testUserIds)).run().changes;
-    res.json({ deleted, testUserIds, testListingIds, testThreadIds });
   });
 
   return _httpServer;
